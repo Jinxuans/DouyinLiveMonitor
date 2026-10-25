@@ -28,7 +28,7 @@ def run_console(live_id):
 def print_usage():
     print("用法:")
     print("  python main.py               启动 GUI")
-    print("  python main.py <直播间ID>     启动 GUI（自动连接）")
+    print("  python main.py <直播间ID>     启动 GUI（选中指定直播间）")
     print("  python main.py console <ID>  控制台模式")
 
 
