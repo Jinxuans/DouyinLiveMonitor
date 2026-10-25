@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 config.json
 data/
+recordings/
+.tools/
 build/
 dist/
 *.spec
