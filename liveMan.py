@@ -12,7 +12,6 @@ import random
 import re
 import string
 import threading
-import time
 import urllib.parse
 
 import requests
@@ -69,7 +68,7 @@ def generateMsToken(length=182):
 
 class DouyinLiveWebFetcher:
 
-    def __init__(self, live_id, on_chat_message=None, on_message=None, cookie=None):
+    def __init__(self, live_id, on_chat_message=None, on_message=None, cookie=None, on_status=None):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id
@@ -77,6 +76,9 @@ class DouyinLiveWebFetcher:
         """
         self.on_chat_message = on_chat_message
         self.on_message = on_message
+        self.on_status = on_status
+        self._stopped = threading.Event()
+        self.ws = None
         self.cookie = cookie or ""
         self.__ttwid = None
         self.__room_id = None
@@ -90,11 +92,17 @@ class DouyinLiveWebFetcher:
         }
     
     def start(self):
-        self._connectWebSocket()
+        try:
+            if not self._stopped.is_set():
+                self._connectWebSocket()
+        finally:
+            self._stopped.set()
+            self.session.close()
     
     def stop(self):
-        self.ws.keep_running = False
-        self.ws.close()
+        self._stopped.set()
+        if self.ws is not None:
+            self.ws.close(timeout=0.2)
     
     @property
     def ttwid(self):
@@ -108,7 +116,7 @@ class DouyinLiveWebFetcher:
             "User-Agent": self.user_agent,
         }
         try:
-            response = self.session.get(self.live_url, headers=headers)
+            response = self.session.get(self.live_url, headers=headers, timeout=10)
             response.raise_for_status()
         except Exception as err:
             print("【X】Request the live url error: ", err)
@@ -131,7 +139,7 @@ class DouyinLiveWebFetcher:
             "cookie": f"ttwid={self.ttwid}&msToken={generateMsToken()}; __ac_nonce=0123407cc00a9e438deb4",
         }
         try:
-            response = self.session.get(url, headers=headers)
+            response = self.session.get(url, headers=headers, timeout=10)
             response.raise_for_status()
         except Exception as err:
             print("【X】Request the live room url error: ", err)
@@ -148,6 +156,11 @@ class DouyinLiveWebFetcher:
         """
         连接抖音直播间websocket服务器，请求直播间数据
         """
+        room_id = self.room_id
+        if self._stopped.is_set():
+            return
+        if not room_id:
+            raise RuntimeError('无法获取直播间 roomId')
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
                "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
                "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
@@ -157,12 +170,12 @@ class DouyinLiveWebFetcher:
                "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
                "&browser_online=true&tz_name=Asia/Shanghai"
                "&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
-               f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
+               f"&internal_ext=internal_src:dim|wss_push_room_id:{room_id}|wss_push_did:7319483754668557238"
                f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
                f"wrds_v:7392094459690748497"
                f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
                f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
-               f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0")
+               f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={room_id}&heartbeatDuration=0")
         
         signature = generateSignature(wss)
         wss += f"&signature={signature}"
@@ -182,32 +195,23 @@ class DouyinLiveWebFetcher:
                                          on_error=self._wsOnError,
                                          on_close=self._wsOnClose)
         try:
-            self.ws.run_forever()
+            if not self._stopped.is_set():
+                websocket.setdefaulttimeout(10)
+                self.ws.run_forever(ping_interval=5, ping_timeout=4,
+                                    ping_payload=bytes(PushFrame(payload_type='hb')))
         except Exception:
             self.stop()
             raise
-    
-    def _sendHeartbeat(self):
-        """
-        发送心跳包
-        """
-        while True:
-            try:
-                heartbeat = PushFrame(payload_type='hb').SerializeToString()
-                self.ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
-                pass
-            except Exception as e:
-                print("【X】心跳包检测错误: ", e)
-                break
-            else:
-                time.sleep(5)
     
     def _wsOnOpen(self, ws):
         """
         连接建立成功
         """
-        pass  # 连接成功
-        threading.Thread(target=self._sendHeartbeat).start()
+        if self._stopped.is_set():
+            ws.close(timeout=0.2)
+            return
+        if self.on_status:
+            self.on_status('connected')
     
     def _wsOnMessage(self, ws, message):
         """
@@ -292,7 +296,8 @@ class DouyinLiveWebFetcher:
     def _emit(self, msg_type, time_str, text, **extra):
         """统一回调"""
         if self.on_message:
-            self.on_message(msg_type, {"time_str": time_str, "text": text, **extra})
+            self.on_message(msg_type, {"time_str": time_str, "text": text, **extra,
+                                       "room_id": self.__room_id})
         if msg_type == 'chat' and self.on_chat_message:
             self.on_chat_message(extra.get('user_name', ''), extra.get('content', ''), extra.get('event_time', 0))
 
@@ -385,6 +390,8 @@ class DouyinLiveWebFetcher:
         time_str = self._fmt_time(self._get_msg_time(message))
         if message.status == 3:
             self._emit('control', time_str, f"[{time_str}] 【状态】 直播间已结束")
+            if self.on_status:
+                self.on_status('ended')
             self.stop()
 
     def _parseRoomStreamAdaptationMsg(self, payload):

@@ -4,15 +4,18 @@
 import json
 import os
 import queue
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
-from datetime import datetime, date
+from datetime import datetime
+from pathlib import Path
 
 import requests
 
 from liveMan import DouyinLiveWebFetcher
+from monitoring import AnchorState, LiveMonitor, QUALITY_ORDER, QUALITY_NAMES, launch_player, safe_component
+from monitor_panel import MonitorPanel
+from message_collector import MessageCollector
 
 CONFIG_FILE = "config.json"
 
@@ -20,19 +23,26 @@ CONFIG_FILE = "config.json"
 # ==================== 通过 API 获取直播间信息 ====================
 def fetch_room_info(rid, cookie=""):
     """通过直播间 ID 获取主播昵称和开播状态，失败返回 None。"""
+    session = requests.Session()
     try:
-        session = requests.Session()
         ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
         session.headers.update({"User-Agent": ua})
 
-        cookie_str = cookie
-        if not cookie_str:
+        cookie_str = (cookie or "").strip()
+        if len(cookie_str) >= 2 and cookie_str[0] == cookie_str[-1] and cookie_str[0] in "\"'":
+            cookie_str = cookie_str[1:-1].strip()
+        cookie_names = {
+            part.split("=", 1)[0].strip()
+            for part in cookie_str.split(";")
+            if "=" in part
+        }
+        if "ttwid" not in cookie_names:
             session.get("https://live.douyin.com/", timeout=10)
             ttwid = session.cookies.get("ttwid")
             if not ttwid:
                 return None
-            cookie_str = f"ttwid={ttwid}"
+            cookie_str = f"{cookie_str}; ttwid={ttwid}" if cookie_str else f"ttwid={ttwid}"
 
         url = (
             "https://live.douyin.com/webcast/room/web/enter/?aid=6383"
@@ -55,18 +65,23 @@ def fetch_room_info(rid, cookie=""):
 
         user = data.get("user", {})
         room_list = data.get("data", [])
-        room = room_list[0] if room_list else {}
+        if not room_list or room_list[0].get('status') not in (2, 4):
+            return None
+        room = room_list[0]
         # status == 2 表示正在直播
         is_live = room.get("status") == 2
         return {
             "nickname": user.get("nickname", ""),
             "is_live": is_live,
+            "room_id": room.get('id_str') or room.get('id'),
             "title": room.get("title", ""),
             "user_count": room.get("user_count_str", "0"),
             "streams": extract_streams(room) if is_live else {},
         }
     except Exception:
         return None
+    finally:
+        session.close()
 
 
 def fetch_anchor_name(rid, cookie=""):
@@ -90,20 +105,6 @@ def extract_streams(room):
             if a: streams['audio'] = a
         except Exception: pass
     return streams
-
-
-QUALITY_ORDER = ['origin', 'FULL_HD1', 'HD1', 'SD2', 'SD1', 'audio']
-QUALITY_NAMES = {'origin': '原画', 'FULL_HD1': '蓝光', 'HD1': '超清', 'SD2': '高清', 'SD1': '标清', 'audio': '仅音频'}
-
-
-def play_with_potplayer(url):
-    for p in [r"C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe",
-              r"C:\Program Files (x86)\DAUM\PotPlayer\PotPlayerMini.exe",
-              r"C:\Program Files\PotPlayer\PotPlayerMini64.exe"]:
-        if os.path.exists(p):
-            subprocess.Popen([p, url])
-            return True
-    return False
 
 
 # ==================== 配置文件操作 ====================
@@ -229,9 +230,7 @@ class ChatWindow:
     """抖音直播弹幕实时聊天窗口"""
 
     def __init__(self):
-        self.fetcher: DouyinLiveWebFetcher = None
         self.msg_queue = queue.Queue()
-        self.running = False
 
         self.config = load_config()
         self.anchors: dict = self.config.setdefault("anchors", {})
@@ -239,16 +238,25 @@ class ChatWindow:
         self._anchor_status: dict = {}   # rid -> {'is_live', 'title', ...}
         self._data_dir = "data"
         self._current_rid = None
-        self._current_date = None
-        self._pending_rid = None
         self._save_lock = threading.Lock()
+        self._closing = False
+        self._status_pending = set()
+        self._save_errors = set()
+        self._archive_paths = {}
+        self.collector = MessageCollector(DouyinLiveWebFetcher, self._enqueue_message, self._append_system)
+        self.monitor = LiveMonitor(fetch_room_info, self._append_system,
+                                   self._on_monitor_result, self.config.get('monitor'), collector=self.collector)
+        self.monitor.configure(self.anchors, self.cookie, self.monitor.settings)
+        self.monitor.external_pending = self._status_pending
 
         self._build_ui()
+        self._tick_monitor()
 
     def _build_ui(self):
         self.root = tk.Tk()
         self.root.title("抖音直播弹幕")
-        self.root.geometry("500x650")
+        self.root.geometry("780x850")
+        self.root.minsize(720, 650)
         self.root.configure(bg="#1e1e1e")
 
         # ---- 主播管理区域 ----
@@ -304,7 +312,15 @@ class ChatWindow:
                                     activebackground="#3c3c3c", activeforeground="#ffffff")
         self.cookie_btn.pack(side=tk.LEFT)
 
+        self.monitor_panel = MonitorPanel(
+            self.root, self.monitor, self._save_monitor_settings,
+            lambda rid: self._anchor_status.get(rid, {}).get('streams', {}))
+        self.monitor_panel.pack(fill=tk.X, padx=10, pady=(8, 4))
+
         # ---- 消息过滤栏 ----
+        tk.Label(self.root, text='消息显示过滤 · 所有采集中的主播 · 不影响消息存档',
+                 bg='#1e1e1e', fg='#cccccc', anchor='w', font=('微软雅黑', 9)).pack(
+                     fill=tk.X, padx=10, pady=(4, 0))
         filter_frame = tk.Frame(self.root, bg="#1e1e1e")
         filter_frame.pack(fill=tk.X, padx=10, pady=(2, 0))
 
@@ -435,77 +451,33 @@ class ChatWindow:
         rid = self._get_selected_rid()
         if not rid:
             return
-        # 没连接或点自己：正常选中+切换
-        if not self._current_rid or rid == self._current_rid:
-            self._pending_rid = None
-            self._check_status(rid)
-            if not self._current_rid:
-                self._switch_fetch(rid)
-            return
-        # 已连接 A，点 B：标蓝+改前缀+检测，不选中不切换
-        self._pending_rid = rid
-        try:
-            idx = list(self.anchors.keys()).index(rid)
-            name = self.anchors[rid]
-            top = self.anchor_listbox.yview()[0]
-            self.anchor_listbox.delete(idx)
-            self.anchor_listbox.insert(idx, f"[检测中] {name}  ({rid})")
-            self.anchor_listbox.itemconfig(idx, bg="#005a99")
-            self.anchor_listbox.yview_moveto(top)
-        except (ValueError, tk.TclError):
-            pass
+        if rid != self._current_rid:
+            self._current_rid = rid
+            self.viewer_label.config(text='')
         self._check_status(rid)
-        self.root.after(1, lambda: self._restore_selection())
-
-    def _restore_selection(self):
-        """恢复当前连接主播的选中状态"""
-        if self._current_rid and self._current_rid in self.anchors:
-            try:
-                aidx = list(self.anchors.keys()).index(self._current_rid)
-                self.anchor_listbox.selection_clear(0, tk.END)
-                self.anchor_listbox.selection_set(aidx)
-            except (ValueError, tk.TclError):
-                pass
 
     def _check_status(self, rid):
         """后台检查直播间开播状态"""
-        if not self._pending_rid or rid == self._current_rid:
+        if self._closing or rid not in self.anchors:
+            return
+        if rid in self.monitor.pending:
+            self.root.after(500, lambda: self._check_status(rid))
+            return
+        if rid in self._status_pending:
+            return
+        self._status_pending.add(rid)
+        if rid == self._current_rid:
             self._update_status("检测中...")
 
         def do_check():
             info = fetch_room_info(rid, self.cookie)
-            self.root.after(0, lambda: self._on_status_checked(rid, info))
+            self.msg_queue.put({'type': 'status_result', 'rid': rid, 'info': info})
 
         threading.Thread(target=do_check, daemon=True).start()
 
     def _on_status_checked(self, rid, info):
-        # 处理 pending
-        if rid == self._pending_rid:
-            self._pending_rid = None
-            is_live = info is not None and info["is_live"]
-            if info:
-                self._anchor_status[rid] = {
-                    "checked": True, "is_live": is_live,
-                    "title": info["title"], "user_count": info["user_count"],
-                    "nickname": info["nickname"], "streams": info.get("streams", {}),
-                }
-            try:
-                idx = list(self.anchors.keys()).index(rid)
-                name = self.anchors[rid]
-                top = self.anchor_listbox.yview()[0]
-                self.anchor_listbox.delete(idx)
-                prefix = "[直播] " if is_live else "[未开] "
-                self.anchor_listbox.insert(idx, f"{prefix}{name}  ({rid})")
-                self.anchor_listbox.yview_moveto(top)
-                self.anchor_listbox.itemconfig(idx, bg="#3c3c3c" if not is_live else self.anchor_listbox.cget("bg"))
-                if is_live:
-                    self.anchor_listbox.selection_clear(0, tk.END)
-                    self.anchor_listbox.selection_set(idx)
-                    self._switch_fetch(rid)
-            except (ValueError, tk.TclError):
-                pass
+        if rid not in self.anchors:
             return
-
         if info is None:
             if rid == self._get_selected_rid():
                 self._update_status("检测失败（可能需要配置 Cookie）")
@@ -538,7 +510,7 @@ class ChatWindow:
                 self.anchor_listbox.selection_set(s)
             self.anchor_listbox.bind('<<ListboxSelect>>', self._on_anchor_select)
 
-        # 状态栏：只显示当前连接的主播，或未连接时显示选中的
+        # 状态栏显示当前选中的主播。
         if rid == self._current_rid or (not self._current_rid and rid == self._get_selected_rid()):
             if is_live:
                 count = info["user_count"]
@@ -580,6 +552,51 @@ class ChatWindow:
         self.config["anchors"] = self.anchors
         self.config["cookie"] = self.cookie
         save_config(self.config)
+        self.monitor.configure(self.anchors, self.cookie, self.monitor.settings)
+
+    def _save_monitor_settings(self, settings):
+        updated = {**self.config, 'monitor': settings}
+        save_config(updated)
+        self.config = updated
+        self.monitor.configure(self.anchors, self.cookie, settings)
+
+    def _render_anchor_status(self, rid, failed=False):
+        if rid not in self.anchors:
+            return
+        idx = list(self.anchors).index(rid)
+        selected = self.anchor_listbox.curselection()
+        top = self.anchor_listbox.yview()[0]
+        info = self._anchor_status.get(rid, {})
+        prefix = '[检测失败]' if failed else ('[直播]' if info.get('is_live') else '[未开]')
+        self.anchor_listbox.delete(idx)
+        self.anchor_listbox.insert(idx, f'{prefix} {self.anchors[rid]}  ({rid})')
+        for index in selected:
+            self.anchor_listbox.selection_set(index)
+        self.anchor_listbox.yview_moveto(top)
+
+    def _on_monitor_result(self, rid, info):
+        # Monitoring must never switch the selected anchor.
+        if rid not in self.anchors:
+            return
+        state = self.monitor.states.setdefault(rid, AnchorState())
+        state.last_check = datetime.now().strftime('%H:%M:%S')
+        state.status = '检测失败，稍后重试' if info is None else ('直播中' if info['is_live'] else '未开播')
+        if info is not None:
+            self._anchor_status[rid] = {'checked': True, **info}
+        self._render_anchor_status(rid, failed=info is None)
+
+    def _tick_monitor(self):
+        self.monitor.tick()
+        self.collector.tick()
+        self.monitor_panel.refresh()
+        if self._current_rid:
+            self._update_status(f'{self.anchors.get(self._current_rid, self._current_rid)} · '
+                                f'{self.collector.status(self._current_rid)}')
+        if self._closing and not self.monitor.recordings and not self.collector.connections:
+            self._poll_queue(reschedule=False)
+            self.root.destroy()
+            return
+        self.root.after(500, self._tick_monitor)
 
     def _show_cookie_config(self):
         win = tk.Toplevel(self.root)
@@ -629,95 +646,85 @@ class ChatWindow:
 
     # -------------------- 弹幕抓取 --------------------
     def _check_all_anchors(self):
-        """一键检测所有主播（不带 Cookie）"""
+        """批量检查状态，不触发自动播放或切换弹幕连接。"""
         self.check_all_btn.config(text="⏳ 检测中...", state=tk.DISABLED)
-        rids = list(self.anchors.keys())
+        rids = [rid for rid in self.anchors if rid not in self._status_pending and rid not in self.monitor.pending]
         if not rids:
             self.check_all_btn.config(text="🔍 一键检测", state=tk.NORMAL)
             return
+        self._status_pending.update(rids)
+        cookie = self.cookie
         def do():
             for rid in rids:
-                info = fetch_room_info(rid)
-                self.root.after(0, lambda r=rid, i=info: self._on_status_checked(r, i))
-            self.root.after(0, lambda: self.check_all_btn.config(text="🔍 一键检测", state=tk.NORMAL))
+                if self._closing:
+                    break
+                info = fetch_room_info(rid, cookie)
+                self.msg_queue.put({'type': 'status_result', 'rid': rid, 'info': info, 'batch': True})
+            self.msg_queue.put({'type': 'check_all_done'})
         threading.Thread(target=do, daemon=True).start()
 
-    def _switch_fetch(self, live_id):
-        """切换抓取目标"""
-        if self.running:
-            self.stop_fetch()
-        self.start_fetch(live_id)
-
-    def start_fetch(self, live_id):
-        self.running = True
-        self._current_rid = live_id
-        self._current_date = date.today().isoformat()
-        self._append_system(f"⏳ 正在连接直播间 {live_id} ...")
-        def on_message(msg_type, data):
-            self.msg_queue.put({"type": msg_type, **data})
-        threading.Thread(target=self._run_fetcher, args=(live_id, on_message), daemon=True).start()
-
-    def _run_fetcher(self, live_id, on_message):
-        try:
-            self.fetcher = DouyinLiveWebFetcher(live_id, on_message=on_message, cookie=self.cookie)
-            self.msg_queue.put({"type": "connected"})
-            self.fetcher.start()
-        except Exception as e:
-            self.msg_queue.put({"type": "error", "msg": str(e)})
-
-    def stop_fetch(self):
-        self.running = False
-        if self.fetcher:
-            try: self.fetcher.stop()
-            except Exception: pass
-            self.fetcher = None
-        self._update_status("已断开")
-        self._append_system("⏹ 已停止")
+    def _enqueue_message(self, data):
+        self.msg_queue.put({**data, 'anchor_name': self.anchors.get(data['rid'], data['rid'])})
 
     def _on_close(self):
-        self.stop_fetch()
-        self.root.destroy()
+        if self._closing:
+            return
+        if self.monitor.recordings and not messagebox.askyesno(
+                '退出程序', '仍有录像正在保存。是否停止所有录像并退出？\n程序会等待文件收尾，不会关闭 PotPlayer。'):
+            return
+        self._closing = True
+        self.monitor.close()
+        self.monitor_panel.toggle.config(state=tk.DISABLED)
+        self._append_system('正在退出，等待录制文件保存完成…')
+        self.root.withdraw()
 
-    def _poll_queue(self):
+    def _poll_queue(self, reschedule=True):
         try:
             while True:
                 data = self.msg_queue.get_nowait()
 
                 msg_type = data.get("type")
-                if msg_type == "connected":
-                    self._append_system("✅ 已连接到直播间，开始接收弹幕...")
-                    self._update_status("● 直播中")
+                if msg_type == 'status_result':
+                    rid = data['rid']
+                    self._status_pending.discard(rid)
+                    if self._closing or rid not in self.anchors:
+                        continue
+                    if data.get('batch'):
+                        self._on_monitor_result(rid, data['info'])
+                    else:
+                        self._on_status_checked(rid, data['info'])
                     continue
-                elif msg_type == "error":
-                    self._append_system(f"❌ 连接失败: {data['msg']}")
-                    self._update_status("连接失败")
-                    self.root.after(0, self.stop_fetch)
+                if msg_type == 'check_all_done':
+                    self.check_all_btn.config(text='🔍 一键检测', state=tk.NORMAL)
                     continue
-
                 # 所有消息都保存，不受过滤开关影响
                 self._save_message(data)
 
                 if msg_type in ("room", "adaptation", "rank"):
                     continue  # 不显示
                 elif msg_type == "stats":
-                    current = data.get("current", 0)
-                    self.viewer_label.config(text=f"👁 {current} 人观看")
+                    if data.get('rid') == self._current_rid:
+                        current = data.get("current", 0)
+                        self.viewer_label.config(text=f"👁 {current} 人观看")
                 elif msg_type == "roomstats":
                     pass
                 else:
                     if not self._msg_allowed(msg_type):
                         continue
                     text = data.get("text", "")
+                    rid = data.get('rid', '')
+                    name = data.get('anchor_name', self.anchors.get(rid, rid))
                     tag = msg_type if msg_type in (
                         "chat", "gift", "like", "member", "social",
                         "fansclub", "emoji", "control"
                     ) else "chat"
-                    self._append_line(text, tag)
+                    self._append_line(f'[{name}（{rid}）] {text}', tag)
 
         except queue.Empty:
             pass
 
-        self.root.after(200, self._poll_queue)
+        if reschedule:
+            self.root.after(200, self._poll_queue)
 
     def _at_bottom(self):
         return self.chat_area.yview()[1] >= 1.0
@@ -742,31 +749,60 @@ class ChatWindow:
         self.status_label.config(text=text)
 
     def _save_message(self, data):
-        """将消息保存到 data/{rid（昵称）}/{date}.jsonl"""
-        rid = self._current_rid
+        """按直播场次归档，并镜像到接收时正在录制的视频旁。"""
+        rid = data.get('rid')
         if not rid:
             return
-        name = self.anchors.get(rid, rid)
-        folder = f"{name}（{rid}）"
+        session_id = data.get('session_id')
+        if not session_id:
+            self._append_system(f'{rid}：消息缺少场次标识，未写入存档')
+            return
+        name = data.get('anchor_name', self.anchors.get(rid, rid))
+        folder = safe_component(f"{name}（{rid}）")
         # 去掉 text 中重复的时间戳前缀
         text = data.get("text", "")
         ts = data.get("time_str", "")
         if ts and text.startswith(f"[{ts}] "):
             text = text[len(ts) + 3:]
         record = {
+            'rid': rid,
+            'session_id': session_id,
+            'received_at': data.get('received_at', datetime.now().isoformat()),
             "time": ts,
             "type": data.get("type", "?"),
             "text": text,
         }
         try:
             with self._save_lock:
-                dir_path = os.path.join(self._data_dir, folder)
+                archive_key = (self._data_dir, rid, session_id)
+                file_path = self._archive_paths.get(archive_key)
+                if file_path is None:
+                    filename = f'{safe_component(session_id)}.jsonl'
+                    # A renamed anchor must still resume the same session after restart.
+                    existing = sorted(Path(self._data_dir).glob(f'*/{filename}'))
+                    file_path = str(existing[0]) if existing else os.path.join(self._data_dir, folder, filename)
+                dir_path = os.path.dirname(file_path)
                 os.makedirs(dir_path, exist_ok=True)
-                file_path = os.path.join(dir_path, f"{self._current_date}.jsonl")
                 with open(file_path, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except Exception:
-            pass  # 保存失败不影响主流程
+                if archive_key not in self._archive_paths:
+                    self._archive_paths[archive_key] = file_path
+                    self._append_system(f'{name}：本场消息保存至 {file_path}')
+                    if session_id.startswith('local_'):
+                        self._append_system(f'{name}：未获取到平台场次 ID，使用本地编号；程序重启后将新建消息文件')
+            self._save_errors.discard(rid)
+        except OSError as exc:
+            if rid not in self._save_errors:
+                self._save_errors.add(rid)
+                self._append_system(f'{name}：消息存档失败：{exc}')
+
+        try:
+            recording = self.monitor.recording_for_message(rid, session_id, record['received_at'])
+            if recording:
+                with self._save_lock, open(recording.message_log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self._append_system(f'{name}：视频消息文件写入失败（{exc}）')
 
     def _get_streams(self):
         rid = self._get_selected_rid()
@@ -804,8 +840,14 @@ class ChatWindow:
         self.root.clipboard_append(url)
 
     def _do_play(self, url):
-        if not play_with_potplayer(url):
-            if messagebox.askyesno("提示", "未找到 PotPlayer，是否复制直链？"):
+        try:
+            rid = self._get_selected_rid()
+            if rid:
+                self.monitor.play(rid, url)
+            else:
+                launch_player(url, self.monitor.settings.get('potplayer', ''))
+        except OSError as exc:
+            if messagebox.askyesno("提示", f"{exc}\n是否复制直链？"):
                 self.root.clipboard_clear(); self.root.clipboard_append(url)
 
     def run(self):
